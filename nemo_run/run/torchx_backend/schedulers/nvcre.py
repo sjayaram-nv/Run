@@ -50,7 +50,7 @@ NVCRE_STATES: dict[NvcrePhase, AppState] = {
     NvcrePhase.IN_PROGRESS: AppState.RUNNING,
     NvcrePhase.SUCCEEDED: AppState.SUCCEEDED,
     NvcrePhase.FAILED: AppState.FAILED,
-    NvcrePhase.UNKNOWN: AppState.PENDING,
+    NvcrePhase.UNKNOWN: AppState.UNKNOWN,
 }
 
 
@@ -102,11 +102,11 @@ class NvcreScheduler(SchedulerMixin, Scheduler[dict]):  # type: ignore
             script_and_args = cmd[1:]  # drop the "python" token; torchrun runs the script directly
             cmd = [
                 "torchrun",
-                "--nnodes=$PET_NNODES",
-                "--nproc_per_node=$PET_NPROC_PER_NODE",
-                "--node_rank=$PET_NODE_RANK",
-                "--master_addr=$PET_MASTER_ADDR",
-                "--master_port=$PET_MASTER_PORT",
+                "--nnodes=$(PET_NNODES)",
+                "--nproc_per_node=$(PET_NPROC_PER_NODE)",
+                "--node_rank=$(PET_NODE_RANK)",
+                "--master_addr=$(PET_MASTER_ADDR)",
+                "--master_port=$(PET_MASTER_PORT)",
             ] + script_and_args
 
         req = NvcreRequest(app=app, executor=executor, cmd=cmd, name=role.name)
@@ -171,7 +171,7 @@ class NvcreScheduler(SchedulerMixin, Scheduler[dict]):  # type: ignore
             return None
 
         phase = executor.status(workloadrun_name)
-        app_state = NVCRE_STATES.get(phase, AppState.PENDING)
+        app_state = NVCRE_STATES.get(phase, AppState.UNKNOWN)
 
         roles = [Role(name=role_name, image="", num_replicas=executor.num_nodes)]
         roles_statuses = [

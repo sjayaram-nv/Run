@@ -73,6 +73,8 @@ class TestNvcreExecutor:
         executor.timeout_per_job = "2h"
         executor.test_scale = "full-scale"
         executor.max_restarts = 3
+        executor.checkpoint_storage_size = "500Gi"
+        executor.checkpoint_storage_class = "fast-ssd"
         executor.gang_scheduler_name = "kai-scheduler"
 
         manifest = executor.build_workloadrun_yaml(["python", "train.py"])
@@ -85,7 +87,7 @@ class TestNvcreExecutor:
         assert spec["volumeMounts"] == executor.volume_mounts
         assert spec["imagePullSecrets"] == [{"name": "ngc-secret"}]
         assert spec["orchestration"] == {"timeoutPerJob": "2h", "testScale": "full-scale"}
-        assert spec["checkpoint"] == {"maxRestarts": 3}
+        assert spec["checkpoint"] == {"storageSize": "500Gi", "storageClassName": "fast-ssd", "maxRestarts": 3}
         assert spec["gangScheduler"] == {"schedulerName": "kai-scheduler"}
 
     # ── _safe_name ─────────────────────────────────────────────────────────────

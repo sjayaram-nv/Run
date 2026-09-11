@@ -14,10 +14,11 @@
 # limitations under the License.
 
 import getpass
+import hashlib
 import json
 import logging
 import os
-import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -97,6 +98,9 @@ class NvcreExecutor(Executor):
     timeout_per_job: str = "24h"
     test_scale: Optional[str] = None  # "intra-node" | "intra-rack" | "full-scale"
     max_restarts: int = 0
+    # Set to enable checkpointing; PVC size is required by the API (e.g. "500Gi").
+    checkpoint_storage_size: Optional[str] = None
+    checkpoint_storage_class: Optional[str] = None  # defaults to cluster default
 
     # ── Launcher ──────────────────────────────────────────────────────────────
     # When True, wrap the python entrypoint with torchrun using the PET_* env
@@ -204,8 +208,13 @@ class NvcreExecutor(Executor):
         if orch:
             spec["orchestration"] = orch
 
-        if self.max_restarts:
-            spec["checkpoint"] = {"maxRestarts": self.max_restarts}
+        if self.checkpoint_storage_size:
+            checkpoint: dict[str, Any] = {"storageSize": self.checkpoint_storage_size}
+            if self.checkpoint_storage_class:
+                checkpoint["storageClassName"] = self.checkpoint_storage_class
+            if self.max_restarts:
+                checkpoint["maxRestarts"] = self.max_restarts
+            spec["checkpoint"] = checkpoint
 
         if self.gang_scheduler_name:
             spec["gangScheduler"] = {"schedulerName": self.gang_scheduler_name}
@@ -218,9 +227,18 @@ class NvcreExecutor(Executor):
         }
 
     def _safe_name(self) -> str:
-        """RFC-1123 safe WorkloadRun name derived from job_name."""
-        name = (self.job_name or "nvcre-job").lower().replace("_", "-").replace(".", "-")
-        return name[:63].rstrip("-")
+        """The last 6 digits of the nanosecond timestamp embedded in experiment_id
+        (format: "<title>_<time_ns>") are used as a suffix so that repeated
+        submissions of the same job produce unique names.
+        """
+        exp_id = getattr(self, "experiment_id", None) or ""
+        job = (self.job_name or "nvcre-job").lower().replace("_", "-").replace(".", "-")
+        # exp_id format is "<title>_<time_ns>"; take the last 6 digits of the ns part.
+        ns_part = exp_id.rsplit("_", 1)[-1] if "_" in exp_id else ""
+        suffix = ns_part[-6:] if ns_part.isdigit() else hashlib.sha256(exp_id.encode()).hexdigest()[:6]
+        # Reserve 7 chars for "-<suffix>"; truncate base to fit within 63 total.
+        base = job[:56].rstrip("-")
+        return f"{base}-{suffix}"
 
     # ── nvcrectl / kubectl helpers ─────────────────────────────────────────────
 
@@ -241,13 +259,7 @@ class NvcreExecutor(Executor):
         return args
 
     def submit(self, yaml_path: str) -> str:
-        """Submit a WorkloadRun YAML and return the workloadrun name.
-
-        nvcrectl generates its own WorkloadRun name and does not necessarily
-        use the ``--name`` flag we pass.  We parse the actual name from
-        nvcrectl's stdout so that subsequent ``status()`` and ``fetch_logs()``
-        calls use the right resource name.
-        """
+        """Submit a WorkloadRun YAML and return the workloadrun name."""
         name = self._safe_name()
         cmd = self._nvcrectl_base() + [
             "workloadrun", "run", yaml_path,
@@ -260,65 +272,9 @@ class NvcreExecutor(Executor):
             raise RuntimeError(
                 f"nvcrectl workloadrun run failed (rc={result.returncode}):\n{result.stderr}"
             )
-
-        actual_name = self._parse_submitted_name(result.stdout)
-        if not actual_name:
-            # nvcrectl output format not recognised — ask kubectl for the most
-            # recently created WorkloadRun in our namespace as a fallback.
-            actual_name = self._latest_workloadrun_name() or name
-        if actual_name != name:
-            logger.info(
-                "WorkloadRun submitted: nvcrectl used name '%s' (we requested '%s')",
-                actual_name, name,
-            )
-        else:
-            logger.info("WorkloadRun '%s' submitted", actual_name)
-        self._workloadrun_name = actual_name
-        return actual_name
-
-    def _latest_workloadrun_name(self) -> str | None:
-        """Return the name of the most recently created WorkloadRun in our namespace.
-
-        Used as a last-resort fallback when nvcrectl output cannot be parsed.
-        A short sleep is applied first to allow the API server to reflect the
-        newly created resource.
-        """
-        time.sleep(2)
-        cmd = self._kubectl_base() + [
-            "get", "workloadruns",
-            "-n", self.namespace,
-            "--sort-by=.metadata.creationTimestamp",
-            "-o", "jsonpath={.items[-1].metadata.name}",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        logger.warning("Could not retrieve latest WorkloadRun via kubectl: %s", result.stderr.strip())
-        return None
-
-    def _parse_submitted_name(self, output: str) -> str | None:
-        """Extract the WorkloadRun name nvcrectl actually assigned from its output.
-
-        nvcrectl may output the name in several formats, e.g.:
-          - kubectl-style: ``workloadrun.nvcre.nvidia.com/name created``
-          - plain:         ``name``
-          - JSON:          ``{"name": "name", ...}``
-        Returns None if no recognisable name is found.
-        """
-        output = output.strip()
-        # kubectl-style: "workloadrun.*/name created|configured|unchanged"
-        m = re.search(r'workloadrun[^/]*/([a-z0-9][a-z0-9-]{2,61})', output, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        # JSON: {"name": "value"} or {"workloadrun": {"name": "value"}}
-        m = re.search(r'"name"\s*:\s*"([a-z0-9][a-z0-9-]{2,61})"', output, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        # Plain: a single token that looks like a k8s name on its own line
-        m = re.search(r'^([a-z][a-z0-9-]{2,61})\s*$', output, re.MULTILINE)
-        if m:
-            return m.group(1)
-        return None
+        logger.info("WorkloadRun '%s' submitted", name)
+        self._workloadrun_name = name
+        return name
 
     def status(self, name: str) -> NvcrePhase:
         """Return the current phase of WorkloadRun *name*.
@@ -663,8 +619,8 @@ class NvcreExecutor(Executor):
         if nsys_prefix:
             cmd = ["nsys"] + nsys_prefix + cmd
         env_exports = "\n".join(f"export {k}={v}" for k, v in self.env_vars.items())
+        cmd_str = " ".join(shlex.quote(a) for a in cmd)
         if max_retries > 0:
-            cmd_str = " ".join(cmd)
             run_block = f"""MAX_RETRIES={max_retries}
 attempt=0
 while [ $attempt -le $MAX_RETRIES ]; do
@@ -676,7 +632,7 @@ while [ $attempt -le $MAX_RETRIES ]; do
 done
 exit $exit_code"""
         else:
-            run_block = " ".join(cmd)
+            run_block = cmd_str
 
         script = f"""#!/usr/bin/env bash
 set -euo pipefail
